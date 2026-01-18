@@ -1,0 +1,87 @@
+[package]
+name = "lan-audio-streamer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Audio Streaming Team"]
+description = "Professional-grade low-latency LAN multi-track audio streaming"
+license = "MIT"
+
+[features]
+default = ["sender", "receiver"]
+sender = []
+receiver = []
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full", "rt-multi-thread", "sync", "time", "net", "macros"] }
+
+# Audio
+cpal = "0.15"
+opus = "0.3"
+
+# Networking
+bytes = "1.5"
+socket2 = { version = "0.5", features = ["all"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# Web UI
+axum = { version = "0.7", features = ["ws"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+
+# Lock-free data structures
+crossbeam = "0.8"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# Utilities
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+dashmap = "5.5"
+futures-util = "0.3"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Configuration
+toml = "0.8"
+directories = "5.0"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_System_Threading",
+    "Win32_Security",
+]}
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.4"
+
+[[bin]]
+name = "sender"
+path = "src/bin/sender.rs"
+
+[[bin]]
+name = "receiver"
+path = "src/bin/receiver.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

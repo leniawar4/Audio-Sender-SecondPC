@@ -1,0 +1,288 @@
+//! Individual track representation
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::audio::buffer::{create_shared_buffer, SharedRingBuffer};
+use crate::config::OpusConfig;
+use crate::error::TrackError;
+use crate::protocol::{TrackConfig, TrackStatus, TrackType};
+use crate::constants::RING_BUFFER_CAPACITY;
+
+/// Track state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackState {
+    /// Track is created but not started
+    Stopped,
+    /// Track is starting
+    Starting,
+    /// Track is running
+    Running,
+    /// Track is stopping
+    Stopping,
+    /// Track encountered an error
+    Error,
+}
+
+/// Audio track (sender or receiver)
+/// 
+/// Note: Encoders/decoders are NOT stored in Track to maintain thread safety.
+/// They should be created and managed separately in the audio processing pipeline.
+pub struct Track {
+    /// Track ID
+    pub id: u8,
+    
+    /// Human-readable name
+    pub name: String,
+    
+    /// Device ID (input for sender, output for receiver)
+    pub device_id: String,
+    
+    /// Track configuration
+    pub config: TrackConfig,
+    
+    /// Current state
+    state: TrackState,
+    
+    /// Muted flag
+    muted: Arc<AtomicBool>,
+    
+    /// Solo flag
+    solo: Arc<AtomicBool>,
+    
+    /// Audio buffer
+    pub buffer: SharedRingBuffer,
+    
+    /// Packets sent/received
+    packets_count: Arc<AtomicU64>,
+    
+    /// Packets lost
+    packets_lost: Arc<AtomicU64>,
+    
+    /// Start time
+    start_time: Option<Instant>,
+    
+    /// Last error message
+    last_error: Option<String>,
+    
+    /// Peak level (dB)
+    peak_level_db: f32,
+}
+
+// Track is now Send + Sync safe (no raw pointers)
+unsafe impl Send for Track {}
+unsafe impl Sync for Track {}
+
+impl Track {
+    /// Create a new track
+    pub fn new(id: u8, config: TrackConfig) -> Self {
+        Self {
+            id,
+            name: config.name.clone(),
+            device_id: config.device_id.clone(),
+            config,
+            state: TrackState::Stopped,
+            muted: Arc::new(AtomicBool::new(false)),
+            solo: Arc::new(AtomicBool::new(false)),
+            buffer: create_shared_buffer(RING_BUFFER_CAPACITY),
+            packets_count: Arc::new(AtomicU64::new(0)),
+            packets_lost: Arc::new(AtomicU64::new(0)),
+            start_time: None,
+            last_error: None,
+            peak_level_db: -96.0,
+        }
+    }
+    
+    /// Create Opus config from track config
+    pub fn create_opus_config(&self) -> OpusConfig {
+        let frame_size = OpusConfig::frame_size_from_ms(
+            48000, // Assuming 48kHz
+            self.config.frame_size_ms,
+        );
+        
+        let base_config = match self.config.track_type {
+            TrackType::Voice => OpusConfig::voice(),
+            TrackType::Music => OpusConfig::music(),
+            TrackType::LowLatency => OpusConfig::low_latency(),
+        };
+        
+        OpusConfig {
+            bitrate: self.config.bitrate,
+            frame_size,
+            channels: self.config.channels,
+            fec: self.config.fec_enabled,
+            ..base_config
+        }
+    }
+    
+    /// Start the track
+    pub fn start(&mut self) -> Result<(), TrackError> {
+        if self.state == TrackState::Running {
+            return Ok(());
+        }
+        
+        self.state = TrackState::Starting;
+        self.start_time = Some(Instant::now());
+        self.packets_count.store(0, Ordering::Relaxed);
+        self.packets_lost.store(0, Ordering::Relaxed);
+        self.state = TrackState::Running;
+        
+        Ok(())
+    }
+    
+    /// Stop the track
+    pub fn stop(&mut self) {
+        self.state = TrackState::Stopping;
+        self.start_time = None;
+        self.state = TrackState::Stopped;
+    }
+    
+    /// Get current state
+    pub fn state(&self) -> TrackState {
+        self.state
+    }
+    
+    /// Set state (internal use)
+    pub fn set_state(&mut self, state: TrackState) {
+        self.state = state;
+    }
+    
+    /// Check if running
+    pub fn is_running(&self) -> bool {
+        self.state == TrackState::Running
+    }
+    
+    /// Set muted state
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+    
+    /// Get muted state
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+    
+    /// Set solo state
+    pub fn set_solo(&self, solo: bool) {
+        self.solo.store(solo, Ordering::Relaxed);
+    }
+    
+    /// Get solo state
+    pub fn is_solo(&self) -> bool {
+        self.solo.load(Ordering::Relaxed)
+    }
+    
+    /// Increment packet count
+    pub fn increment_packets(&self) {
+        self.packets_count.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    /// Increment lost packet count
+    pub fn increment_lost(&self) {
+        self.packets_lost.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    /// Get packet count
+    pub fn packets_count(&self) -> u64 {
+        self.packets_count.load(Ordering::Relaxed)
+    }
+    
+    /// Get lost packet count
+    pub fn packets_lost(&self) -> u64 {
+        self.packets_lost.load(Ordering::Relaxed)
+    }
+    
+    /// Update peak level from samples
+    pub fn update_level(&mut self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        
+        let peak = samples.iter()
+            .map(|s| s.abs())
+            .fold(0.0f32, f32::max);
+        
+        // Convert to dB
+        let db = if peak > 0.0 {
+            20.0 * peak.log10()
+        } else {
+            -96.0
+        };
+        
+        // Smooth the level (simple IIR filter)
+        self.peak_level_db = self.peak_level_db * 0.9 + db * 0.1;
+    }
+    
+    /// Get current level in dB
+    pub fn level_db(&self) -> f32 {
+        self.peak_level_db
+    }
+    
+    /// Set error state
+    pub fn set_error(&mut self, error: String) {
+        self.state = TrackState::Error;
+        self.last_error = Some(error);
+    }
+    
+    /// Get last error
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+    
+    /// Update configuration
+    pub fn update_config(&mut self, update: &crate::protocol::TrackConfigUpdate) -> Result<(), TrackError> {
+        if let Some(ref name) = update.name {
+            self.name = name.clone();
+            self.config.name = name.clone();
+        }
+        
+        if let Some(ref device_id) = update.device_id {
+            self.device_id = device_id.clone();
+            self.config.device_id = device_id.clone();
+        }
+        
+        if let Some(bitrate) = update.bitrate {
+            self.config.bitrate = bitrate;
+            // Note: If encoder exists elsewhere, caller needs to update it
+        }
+        
+        if let Some(frame_size_ms) = update.frame_size_ms {
+            self.config.frame_size_ms = frame_size_ms;
+            // Note: Frame size change requires encoder recreation
+        }
+        
+        if let Some(fec) = update.fec_enabled {
+            self.config.fec_enabled = fec;
+            // Note: If encoder exists elsewhere, caller needs to update it
+        }
+        
+        Ok(())
+    }
+    
+    /// Get track status for reporting
+    pub fn status(&self) -> TrackStatus {
+        TrackStatus {
+            track_id: self.id,
+            name: self.name.clone(),
+            device_id: self.device_id.clone(),
+            active: self.is_running(),
+            muted: self.is_muted(),
+            solo: self.is_solo(),
+            bitrate: self.config.bitrate,
+            frame_size_ms: self.config.frame_size_ms,
+            packets_sent: self.packets_count(),
+            packets_received: self.packets_count(),
+            packets_lost: self.packets_lost(),
+            current_latency_ms: 0.0, // TODO: Calculate actual latency
+            jitter_ms: 0.0, // TODO: Calculate jitter
+            level_db: self.peak_level_db,
+        }
+    }
+}
+
+impl Drop for Track {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
